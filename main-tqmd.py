@@ -10,6 +10,11 @@ from torch_geometric.datasets import ZINC
 import torch.optim as optim
 from sklearn.metrics import r2_score
 from tqdm import tqdm
+# ===== DDP相关 =====
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
+import os
 import warnings
 
 warnings.filterwarnings('ignore')
@@ -493,11 +498,12 @@ def eval_epoch(model, loader, criterion, device):
     return mse, mae, rmse, r2
 """
 
-def train_epoch(model, loader, optimizer, criterion, device):
+def train_epoch(model, loader, optimizer, criterion, device, rank):
     model.train()
     total_loss = 0
     all_preds = []
     all_targets = []
+<<<<<<< HEAD:main-tqmd.py
     
 
 # 强制标准输出无缓冲
@@ -517,7 +523,20 @@ def train_epoch(model, loader, optimizer, criterion, device):
         maxinterval=15.0,  # 最大更新间隔1秒
         dynamic_ncols=True
     )
+=======
+>>>>>>> dca8cf3376edc97d3211112bb8451931db03be2d:hyx.py
 
+    if rank == 0:
+        pbar = tqdm(
+            loader,
+            desc="Training",
+            leave=False,
+            mininterval=3.0,
+            maxinterval=15.0,
+            dynamic_ncols=True
+        )
+    else:
+        pbar = loader
 
     for data in pbar:
         data = data.to(device)
@@ -526,10 +545,11 @@ def train_epoch(model, loader, optimizer, criterion, device):
         loss = criterion(out, data.y)
         loss.backward()
         optimizer.step()
-        
+
         total_loss += loss.item() * data.num_graphs
         all_preds.append(out.detach().cpu())
         all_targets.append(data.y.cpu())
+<<<<<<< HEAD:main-tqmd.py
         
         # 实时更新进度条显示当前loss
         pbar.set_postfix({
@@ -538,51 +558,77 @@ def train_epoch(model, loader, optimizer, criterion, device):
         })
     
     # 计算指标
+=======
+
+        # ⭐ 只有 rank0 更新进度条
+        if rank == 0:
+            pbar.set_postfix({
+                'loss': f'{loss.item():.4f}',
+                'avg_loss': f'{total_loss/(len(all_preds)*128):.4f}'
+            })
+
+>>>>>>> dca8cf3376edc97d3211112bb8451931db03be2d:hyx.py
     all_preds = torch.cat(all_preds)
     all_targets = torch.cat(all_targets)
     mse = total_loss / len(loader.dataset)
     mae = torch.mean(torch.abs(all_preds - all_targets)).item()
     rmse = torch.sqrt(torch.mean((all_preds - all_targets) ** 2)).item()
     r2 = r2_score(all_targets.numpy(), all_preds.numpy())
-    
+
     return mse, mae, rmse, r2
 
 @torch.no_grad()
-def eval_epoch(model, loader, criterion, device):
+def eval_epoch(model, loader, criterion, device,rank):
     model.eval()
     total_loss = 0
     all_preds = []
     all_targets = []
     
-    # 验证集也可以用tqdm
-    pbar = tqdm(loader, desc="Validating", leave=False)
-    
+    if rank == 0:
+        pbar = tqdm(loader, desc="Validating", leave=False)
+    else:
+        pbar = loader
+
     for data in pbar:
         data = data.to(device)
         out = model(data).squeeze()
         loss = criterion(out, data.y)
-        
+
         total_loss += loss.item() * data.num_graphs
         all_preds.append(out.cpu())
         all_targets.append(data.y.cpu())
-        
-        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-    
+
+        if rank == 0:
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+
     all_preds = torch.cat(all_preds)
     all_targets = torch.cat(all_targets)
     mse = total_loss / len(loader.dataset)
     mae = torch.mean(torch.abs(all_preds - all_targets)).item()
     rmse = torch.sqrt(torch.mean((all_preds - all_targets) ** 2)).item()
     r2 = r2_score(all_targets.numpy(), all_preds.numpy())
-    
+
     return mse, mae, rmse, r2
+
+
+def setup_ddp():
+    dist.init_process_group(backend="nccl")
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    return local_rank
 
 # ------------------- 主程序 -------------------
 if __name__ == "__main__":
     # 设置设备
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    local_rank = setup_ddp()
+    device = torch.device(f'cuda:{local_rank}')
 
+    rank = dist.get_rank()
+
+    if rank == 0:
+        print(f"Using device: {device}")
+
+        
     # 使用绝对路径并确保是原始字符串
     root_path = "/home/jingyj/HYX/ZINC"
 
@@ -592,11 +638,15 @@ if __name__ == "__main__":
     test_dataset = ZINC(root=root_path, subset=True, split='test')
 
     
-    train_loader = DataLoader(train_dataset, batch_size=128, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=128, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=128, shuffle=False)
+    train_sampler = DistributedSampler(train_dataset)
+    val_sampler = DistributedSampler(val_dataset, shuffle=False)
+    test_sampler = DistributedSampler(test_dataset, shuffle=False)
 
-    # 获取输入维度
+    train_loader = DataLoader(train_dataset, batch_size=128, sampler=train_sampler)
+    val_loader = DataLoader(val_dataset, batch_size=128, sampler=val_sampler)
+    test_loader = DataLoader(test_dataset, batch_size=128, sampler=test_sampler)
+
+    # 获取输入维度f
     sample_data = train_dataset[0]
     in_channels = sample_data.x.size(1)  # ZINC中为28
 
@@ -638,6 +688,8 @@ if __name__ == "__main__":
         use_sinkhorn=use_sinkhorn
     ).to(device)
 
+    model = DDP(model, device_ids=[local_rank])
+
     # 优化器和损失函数
     optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=1e-5)
     criterion = nn.MSELoss()
@@ -645,27 +697,55 @@ if __name__ == "__main__":
 
     # 训练循环
     best_val_mse = float('inf')
+<<<<<<< HEAD:main-tqmd.py
     print("Starting training...")
+=======
+    if rank == 0:
+        print("Starting training...")
+    num_epochs = 50
+
+>>>>>>> dca8cf3376edc97d3211112bb8451931db03be2d:hyx.py
     # 添加epoch级别的进度条f
-    for epoch in tqdm(range(1, 51), desc="Epochs"):
-        train_mse, train_mae, train_rmse, train_r2 = train_epoch(model, train_loader, optimizer, criterion, device)
-        val_mse, val_mae, val_rmse, val_r2 = eval_epoch(model, val_loader, criterion, device)
+    for epoch in range(1, num_epochs + 1):
 
-        print(f'Epoch {epoch:03d} | '
-              f'Train MSE: {train_mse:.4f} MAE: {train_mae:.4f} RMSE: {train_rmse:.4f} R2: {train_r2:.4f} | '
-              f'Val MSE: {val_mse:.4f} MAE: {val_mae:.4f} RMSE: {val_rmse:.4f} R2: {val_r2:.4f}')
+        train_sampler.set_epoch(epoch)
 
-        if val_mse < best_val_mse:
+        if rank == 0:
+            print(f"\nEpoch {epoch}")
+
+        train_mse, train_mae, train_rmse, train_r2 = train_epoch(
+            model, train_loader, optimizer, criterion, device, rank
+        )
+        val_mse, val_mae, val_rmse, val_r2 = eval_epoch(
+            model, val_loader, criterion, device, rank
+        )
+
+        # ⭐ 只让 rank0 打印
+        if rank == 0:
+            print(f'Epoch {epoch:03d} | '
+                  f'Train MSE: {train_mse:.4f} MAE: {train_mae:.4f} RMSE: {train_rmse:.4f} R2: {train_r2:.4f} | '
+                  f'Val MSE: {val_mse:.4f} MAE: {val_mae:.4f} RMSE: {val_rmse:.4f} R2: {val_r2:.4f}')
+
+        # ⭐ 只让 rank0 保存 + 修复 DDP bug
+        if rank == 0 and val_mse < best_val_mse:
             best_val_mse = val_mse
-            torch.save(model.state_dict(), 'best_model.pth')
+            torch.save(model.module.state_dict(), 'best_model.pth')
             print(f'  -> Best model saved (val MSE: {val_mse:.4f})')
 
+    
 
-    # 加载最佳模型并在测试集上评估
-    print("\nEvaluating on test set...")
-    model.load_state_dict(torch.load('best_model.pth'))
-    test_mse, test_mae, test_rmse, test_r2 = eval_epoch(model, test_loader, criterion, device)
-    print(f'Test MSE: {test_mse:.4f} MAE: {test_mae:.4f} RMSE: {test_rmse:.4f} R2: {test_r2:.4f}')
+
+    if rank == 0:
+        print("\nEvaluating on test set...")
+
+    # 所有进程都要加载（DDP要求）
+    state_dict = torch.load('best_model.pth', map_location=device)
+    model.module.load_state_dict(state_dict)
+
+    test_mse, test_mae, test_rmse, test_r2 = eval_epoch(model, test_loader, criterion, device, rank)
+
+    if rank == 0:
+        print(f'Test MSE: {test_mse:.4f} MAE: {test_mae:.4f} RMSE: {test_rmse:.4f} R2: {test_r2:.4f}')
 
     # 打印当前配置
     print("\n--- Configuration ---")

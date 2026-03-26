@@ -16,6 +16,7 @@ data/
 dataset/
 raw_data/
 processed_data/
+log/
 
 # Python 缓存
 __pycache__/
